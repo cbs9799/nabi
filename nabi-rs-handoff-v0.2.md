@@ -2815,6 +2815,19 @@ cargo watch -x check -x test
 - § 7.6: nabi.yaml `prompting:` 블록 + `context_budget.caveman: 250` 추가
 - § 6 Phase 4: Context Builder layer 0 = caveman, escape trigger 평가, 인터페이스별 정책 검증
 
+**v0.3 ultraplan 보강 (one-shot 개발 가능 수준으로 detail 추가)**:
+
+- § 15 신규: nabi.db 전체 스키마 (devices / sessions / messages + FTS / permission_requests / cost_ledger / push_subscriptions / telegram_chats / audit_log / raw_events / context_manifests / memory_events). V0001__initial.sql 한 곳에 모음
+- § 16 신규: `NabiError` thiserror 기반 enum 전체 정의 + From 구현
+- § 17 신규: WebSocket 프로토콜 (v=1 envelope, client→server / server→client 메시지 전체, 재접속 / 하트비트 / 백필 / 에러 코드 enum)
+- § 18 신규: SKILL.md / MEMORY.md / Daily / Topic 마크다운 frontmatter 스펙
+- § 19 신규: refinery 기반 migration 시스템 (forward-only, PRAGMA setup)
+- § 20 신규: `.github/workflows/ci.yml` 구체 yaml (fmt/clippy/build/test/audit + macOS canary 분리)
+- § 21 신규: Phase Acceptance Matrix — Phase -1 ~ Phase 12 모두 구체 명령 / exit 0 / grep 조건
+- § 22 신규: 9개 crate 각각의 Cargo.toml [dependencies] (workspace deps 활용), workspace deps 추가 항목 patch
+- § 23 신규: 결정 트리 (CLI spec 차이 / provider 추가 / schema 변경 / 비용 폭주)
+- § 24 신규: 코딩 규칙 (async / error / channel / DB / 비밀 관리)
+
 **미수정 / 후속**:
 
 - § 3.1 pmset 모드 통일 (`-a` vs `-c`) — Phase -1 스크립트 시점 실제 운영 모드 확인 후 반영
@@ -2861,10 +2874,842 @@ Phase 0-12 정의, 아키텍처 확정, Open Decisions 7개 식별.
 
 ---
 
+---
+
+## 15. nabi.db 전체 스키마 (v0.3 신규 / ultraplan 보강)
+
+§ 9.5의 audit_log / raw_events / context_manifests를 포함해 전체 테이블을 한 곳에 모음. `migrations/V0001__initial.sql`이 정확한 source of truth.
+
+### 15.1 V0001__initial.sql
+
+```sql
+-- WAL + busy_timeout은 connection open 시 PRAGMA로 (§ 19)
+
+CREATE TABLE devices (
+    id TEXT PRIMARY KEY,                    -- uuid v4
+    name TEXT NOT NULL,                     -- "home-mac-tui", "iphone-pwa"
+    kind TEXT NOT NULL,                     -- tui | pwa | telegram | service
+    fingerprint TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,                    -- nabi 세션 uuid
+    claude_session_id TEXT,                 -- ~/.claude/projects/ id (provider별)
+    provider_name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    title TEXT,                             -- 자동 생성 (보조 모델)
+    source TEXT NOT NULL,                   -- 'web' | 'tui' | 'telegram' | 'imported'
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    cost_usd_total REAL NOT NULL DEFAULT 0,
+    tokens_in_total INTEGER NOT NULL DEFAULT 0,
+    tokens_out_total INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC);
+CREATE INDEX idx_sessions_archived ON sessions(archived);
+CREATE INDEX idx_sessions_claude_sid ON sessions(claude_session_id);
+
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,                     -- user | assistant | tool | system
+    content_preview TEXT,                   -- 첫 200자
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    cost_usd REAL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, seq)
+);
+CREATE INDEX idx_messages_session ON messages(session_id, seq);
+
+-- FTS는 content_preview만 인덱싱 (full content는 ~/.claude/projects/ jsonl이 ground truth)
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    session_id UNINDEXED,
+    role UNINDEXED,
+    content,
+    seq UNINDEXED,
+    content='messages',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, session_id, role, content, seq)
+    VALUES (new.id, new.session_id, new.role, new.content_preview, new.seq);
+END;
+
+CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content, seq)
+    VALUES('delete', old.id, old.session_id, old.role, old.content_preview, old.seq);
+END;
+
+CREATE TABLE permission_requests (
+    id TEXT PRIMARY KEY,                    -- uuid
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_use_id TEXT,
+    tool_name TEXT NOT NULL,
+    input JSON NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | allowed | denied | timeout | superseded
+    decided_by_device TEXT REFERENCES devices(id),
+    decided_at TEXT,
+    response_input JSON,                    -- updatedInput (allow 시)
+    reason TEXT,                            -- deny 사유
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_perm_session ON permission_requests(session_id);
+CREATE INDEX idx_perm_status ON permission_requests(status, created_at);
+
+CREATE TABLE cost_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    provider_name TEXT NOT NULL,
+    track TEXT NOT NULL,                    -- 'subscription' | 'api_key'
+    model TEXT NOT NULL,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    tokens_cache_read INTEGER,
+    tokens_cache_write INTEGER,
+    cost_usd REAL NOT NULL,
+    invocation_id TEXT,
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_cost_occurred ON cost_ledger(occurred_at);
+CREATE INDEX idx_cost_track ON cost_ledger(track, occurred_at);
+CREATE INDEX idx_cost_session ON cost_ledger(session_id);
+
+CREATE TABLE push_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT,
+    failures INTEGER NOT NULL DEFAULT 0      -- 4xx 5+ → 자동 해제
+);
+
+CREATE TABLE telegram_chats (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    allowed INTEGER NOT NULL DEFAULT 0,
+    active_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    last_msg_at TEXT
+);
+
+CREATE TABLE audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    session_id TEXT,
+    event_type TEXT NOT NULL,
+    actor TEXT,                              -- device_id 또는 'agent'
+    details JSON NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_audit_session ON audit_log(session_id);
+CREATE INDEX idx_audit_type ON audit_log(event_type);
+CREATE INDEX idx_audit_time ON audit_log(timestamp);
+
+CREATE TABLE raw_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    provider TEXT,
+    raw JSON NOT NULL,
+    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_raw_session ON raw_events(session_id);
+
+CREATE TABLE context_manifests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    message_seq INTEGER NOT NULL,
+    caveman_active INTEGER NOT NULL DEFAULT 1,
+    skills_loaded JSON,
+    memory_entries JSON,
+    wiki_pages JSON,
+    token_estimate INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_manifest_session ON context_manifests(session_id, message_seq);
+
+-- memory.db (read-only) shadow events. Phase 4부터 write 시작.
+CREATE TABLE memory_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,                -- 'add' | 'update' | 'tag'
+    memory_db_id INTEGER,                    -- legacy memory.db 참조 (있으면)
+    content TEXT NOT NULL,
+    category TEXT,
+    tags JSON,
+    source_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_memev_session ON memory_events(source_session_id);
+```
+
+### 15.2 후속 마이그레이션 예약 슬롯
+
+- V0002: Phase 6 — provider state 캐시 테이블 (모델 가격 / capabilities 동적 overlay)
+- V0003: Phase 10 — push notification 로그 / VAPID 키 회전 기록
+- V0004: Phase 12 — health metrics snapshot 테이블 (선택)
+
+### 15.3 데이터 보존 정책
+
+- `raw_events`, `audit_log`: 90일 이후 일별 archive (월별 sqlite 파일 분리)
+- `cost_ledger`: 무기한 보존 (월별 요약은 view로)
+- `messages`, `permission_requests`: 무기한, 단 사용자 명시적 삭제 시 cascade
+
+---
+
+## 16. NabiError 타입 (v0.3 신규)
+
+`nabi-core/src/error.rs`:
+
+```rust
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum NabiError {
+    #[error("io: {0}")]
+    Io(String),
+
+    #[error("parse: {0}")]
+    Parse(String),
+
+    #[error("subprocess spawn failed: {0}")]
+    Spawn(String),
+
+    #[error("subprocess died unexpectedly: exit={0}")]
+    SubprocessExit(i32),
+
+    #[error("auth failed: {0}")]
+    Auth(String),
+
+    #[error("permission denied: {tool} — {reason}")]
+    PermissionDenied { tool: String, reason: String },
+
+    #[error("permission timeout: {request_id}")]
+    PermissionTimeout { request_id: String },
+
+    #[error("provider error: {provider} — {message}")]
+    Provider { provider: String, message: String },
+
+    #[error("provider not found: {0}")]
+    ProviderNotFound(String),
+
+    #[error("db: {0}")]
+    Db(String),
+
+    #[error("mcp: {0}")]
+    Mcp(String),
+
+    #[error("budget exceeded: invocation=${cost_usd:.4} > ${limit:.2}")]
+    BudgetExceeded { cost_usd: f64, limit: f64 },
+
+    #[error("daily cap exceeded: track={track}, used=${used:.2}, cap=${cap:.2}")]
+    DailyCapExceeded { track: String, used: f64, cap: f64 },
+
+    #[error("cancelled by user")]
+    Cancelled,
+
+    #[error("config: {0}")]
+    Config(String),
+
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+impl From<std::io::Error> for NabiError {
+    fn from(e: std::io::Error) -> Self { NabiError::Io(e.to_string()) }
+}
+impl From<rusqlite::Error> for NabiError {
+    fn from(e: rusqlite::Error) -> Self { NabiError::Db(e.to_string()) }
+}
+impl From<serde_json::Error> for NabiError {
+    fn from(e: serde_json::Error) -> Self { NabiError::Parse(format!("json: {}", e)) }
+}
+impl From<reqwest::Error> for NabiError {
+    fn from(e: reqwest::Error) -> Self { NabiError::Provider { provider: "http".into(), message: e.to_string() } }
+}
+```
+
+운영 규칙: anyhow는 main / binary 진입점에서만, 라이브러리는 NabiError 사용.
+
+---
+
+## 17. WebSocket 프로토콜 (v0.3 신규)
+
+### 17.1 Envelope
+
+모든 메시지: `{"v":1,"type":"...", ...}`
+
+- `v`: protocol 버전, 현재 1. breaking change 시 +1
+- `type`: 메시지 종류
+- 선택 `id`: ack/reply 매칭용
+- 선택 `sid`: 세션 uuid
+
+### 17.2 Client → Server
+
+```json
+{"v":1,"type":"chat","id":"c-1","sid":"<sid>","content":"안녕"}
+{"v":1,"type":"chat_with_attachments","id":"c-1","sid":"<sid>","content":"...","attachments":[{"kind":"image","data_url":"..."}]}
+{"v":1,"type":"cancel","sid":"<sid>"}
+{"v":1,"type":"permission_response","request_id":"<rid>","allow":true,"updated_input":null}
+{"v":1,"type":"permission_response","request_id":"<rid>","allow":false,"reason":"too dangerous"}
+{"v":1,"type":"session_new","provider":"claude_subscription","model":"sonnet","source":"pwa"}
+{"v":1,"type":"session_list","limit":50,"archived":false,"cursor":null}
+{"v":1,"type":"session_subscribe","sid":"<sid>"}
+{"v":1,"type":"session_unsubscribe","sid":"<sid>"}
+{"v":1,"type":"session_archive","sid":"<sid>","archived":true}
+{"v":1,"type":"ping","t":1735000000}
+```
+
+### 17.3 Server → Client
+
+```json
+{"v":1,"type":"session_started","sid":"<sid>","claude_sid":"<csid>","model":"sonnet","tools":["Read","Bash"]}
+{"v":1,"type":"text_delta","sid":"<sid>","content":"..."}
+{"v":1,"type":"tool_use_start","sid":"<sid>","tool_use_id":"<tid>","name":"Bash"}
+{"v":1,"type":"tool_use_input","sid":"<sid>","tool_use_id":"<tid>","partial_json":"..."}
+{"v":1,"type":"tool_result","sid":"<sid>","tool_use_id":"<tid>","output":"...","is_error":false}
+{"v":1,"type":"permission_request","sid":"<sid>","request_id":"<rid>","tool":"Bash","input":{"command":"rm ..."},"timeout_sec":300}
+{"v":1,"type":"permission_already_decided","request_id":"<rid>","decided_by_device":"<did>","allowed":true}
+{"v":1,"type":"api_retry","sid":"<sid>","attempt":1,"reason":"overloaded"}
+{"v":1,"type":"mcp_failure","sid":"<sid>","server":"nabi_auth","error":"..."}
+{"v":1,"type":"done","sid":"<sid>","cost_usd":0.043,"tokens_in":1234,"tokens_out":567,"cache_read":0,"cache_write":2000}
+{"v":1,"type":"error","sid":"<sid>","code":"budget_exceeded","message":"..."}
+{"v":1,"type":"heartbeat","t":1735000000}
+{"v":1,"type":"pong","t":1735000000}
+{"v":1,"type":"session_list_reply","sessions":[{"id":"<sid>","title":"...","updated_at":"...","cost_usd":0.5,"archived":false}],"next_cursor":null}
+{"v":1,"type":"cost_alert","track":"api_key","used":24.50,"cap":30.00,"threshold":0.80}
+```
+
+### 17.4 재접속 / 하트비트 / 백필
+
+- 클라이언트: 25초마다 `ping`. 60초간 server 무응답 → 재접속
+- 서버: 30초마다 모든 구독자에 `heartbeat`
+- 재접속 후: `session_subscribe`로 진행 중 세션 stream 재구독. 누락 토큰은 별도 REST `GET /sessions/{sid}/messages?since_seq=N`로 backfill
+- 진행 중 invocation 도중 클라이언트 끊김 → 서버는 계속 실행 (Claude CLI subprocess 유지). 응답은 nabi.db에 저장. 재접속 시 누락분 backfill
+- 권한 요청은 끊긴 디바이스 외 모두에게 전파. 어느 디바이스가 먼저 결정하면 나머지에 `permission_already_decided`
+
+### 17.5 에러 코드 enum
+
+`code` 필드 표준 값:
+
+- `budget_exceeded`, `daily_cap_exceeded`, `subprocess_died`, `provider_unavailable`, `auth_failed`, `permission_timeout`, `session_not_found`, `rate_limited`, `internal`
+
+---
+
+## 18. Skill / Wiki / Daily Log 포맷 (v0.3 신규)
+
+### 18.1 SKILL.md (`config/skills/*.md` 및 `~/clawd/skills/*.md`)
+
+```markdown
+---
+name: tendril
+description: 텐드릴 페이스 API 클라이언트 사용법
+triggers: [tendril, 텐드릴, tendril-api]
+tags: [api, 텐드릴]
+priority: 1
+max_tokens: 2000
+---
+
+# 텐드릴 페이스 API
+
+OAuth: POST /api/auth/token
+...
+```
+
+frontmatter 스키마:
+- `name` (필수, kebab-case, 파일명과 일치)
+- `description` (필수, 1줄)
+- `triggers` (배열, 부분 매치 — 사용자 메시지에 단어 등장 시 자동 로드)
+- `tags` (배열, cross-link용)
+- `priority` (정수, 낮을수록 우선. 다중 매치 시 정렬 + 토큰 예산 내 절단)
+- `max_tokens` (정수, 본문 토큰 cap)
+
+파서: `nabi-skills::loader`. yaml frontmatter는 `serde_yaml`, 본문은 그대로 문자열.
+
+### 18.2 MEMORY.md hub (`~/clawd/MEMORY.md`)
+
+```markdown
+# MEMORY hub
+
+## Active topics
+- [tendril](topics/tendril.md) — 텐드릴 통합
+- [tistory](topics/tistory.md) — 블로그 자동화
+
+## Daily
+- [2026-05-16](daily/2026-05-16.md)
+- [2026-05-15](daily/2026-05-15.md)
+
+## Index
+[전체 색인](index.md)
+```
+
+파서: 마크다운 링크 추출 → topic / daily 분류. Context Builder가 최신 항목 우선 포함, 토큰 예산 내 절단.
+
+### 18.3 Daily Log (`~/clawd/daily/YYYY-MM-DD.md`)
+
+```markdown
+---
+date: 2026-05-16
+tags: [nabi-rs, planning]
+---
+
+# 2026-05-16
+
+## 작업
+- nabi-rs handoff v0.3 작성
+
+## 결정
+- 기존 서비스 아카이빙 (§ 10.8)
+
+## 학습
+- caveman plugin = 출력 토큰만 단축
+```
+
+frontmatter 없어도 동작. 파서는 첫 `# YYYY-MM-DD` 또는 frontmatter `date` 둘 중 하나로 날짜 결정.
+
+### 18.4 Topic Note (`~/clawd/topics/*.md`)
+
+자유 양식. frontmatter 권장:
+
+```markdown
+---
+title: 텐드릴 통합
+status: active        # active | dormant | archived
+last_updated: 2026-05-16
+---
+```
+
+---
+
+## 19. Migration 시스템 (v0.3 신규)
+
+- crate: `refinery` (Rust 친화, runtime 적용, forward-only)
+- 위치: `migrations/V0001__initial.sql`, `V0002__...sql`
+- 적용: `nabi-server` boot 시점 (memory writer actor 시작 전)
+- 명명: `V<4자리>__<snake_case_description>.sql`
+- 적용 이력: `refinery_schema_history` 테이블 자동 생성
+- rollback: forward-only. 문제 시 백업 (Litestream R2)에서 복원
+- connection 초기화 PRAGMA: `journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`, `foreign_keys=ON`
+
+```rust
+// nabi-memory/src/migrations.rs
+mod embedded {
+    use refinery::embed_migrations;
+    embed_migrations!("../../migrations");
+}
+
+pub fn run(conn: &mut rusqlite::Connection) -> Result<(), NabiError> {
+    embedded::migrations::runner()
+        .run(conn)
+        .map_err(|e| NabiError::Db(format!("migration: {}", e)))?;
+    Ok(())
+}
+
+pub fn setup_pragmas(conn: &rusqlite::Connection) -> Result<(), NabiError> {
+    conn.execute_batch("
+        PRAGMA journal_mode=WAL;
+        PRAGMA busy_timeout=5000;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA foreign_keys=ON;
+    ")?;
+    Ok(())
+}
+```
+
+memory-sync.db는 read-only이므로 migration 적용 안 함. PRAGMA `query_only=ON`으로 connection 열기.
+
+---
+
+## 20. CI Workflow (v0.3 신규)
+
+`.github/workflows/ci.yml`:
+
+```yaml
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: build
+        run: cargo build --workspace --all-features
+      - name: test
+        run: cargo test --workspace --all-features
+      - name: audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
+```
+
+Phase 9.4 secret canary는 macOS runner 필요 (claude CLI 의존). 별도 nightly job으로 분리:
+
+```yaml
+  canary-macos:
+    runs-on: macos-latest
+    if: github.event_name == 'schedule'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: install claude
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+      - name: secret canary
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_CANARY_KEY }}
+        run: ./scripts/secret-canary.sh
+```
+
+cron schedule (`on: schedule: - cron: "0 18 * * *"` = 한국 시간 03:00) 추가.
+
+---
+
+## 21. Phase Acceptance Matrix (v0.3 신규)
+
+각 Phase 머지 전 통과해야 할 구체 명령. 모두 exit 0 + grep 매치 시 머지 OK.
+
+### Phase -1
+- `./scripts/phase-minus-1.sh` exit 0
+- `ls -d ~/backups/nabi-migration-*` 결과 1개 이상
+- `pmset -g | grep -E '^\s*sleep\s+0\s*$'` 매치
+- `lsof -i :9912` empty
+- `claude -p "ping"` 응답 받음
+- `lsof -i :8787` 매치 (claude-telegram-bridge 가동 중 확인)
+
+### Phase 0
+- `cargo build --workspace` exit 0
+- `cargo run -p nabi-cli -- --version` 출력에 `nabi`
+- `cargo fmt --all -- --check` exit 0
+- `cargo clippy --all-targets -- -D warnings` exit 0
+- `.github/workflows/ci.yml` last run = success
+
+### Phase 1
+- `cargo test -p nabi-core --lib` exit 0
+- `cargo run -p nabi-cli -- chat --provider mock "echo: hi"` stdout에 "echo: hi"
+- Provider trait + Capabilities + StreamEvent + Message + ChatRequest 컴파일
+
+### Phase 2a
+- `tests/fixtures/stream-json/` 파일 6개 모두 존재 (plain, tool-use, permission-abort, api-retry, mcp-failure, session-resume)
+- `tests/fixtures/auth-matrix.md` 4셀 결과 기록
+- `cargo test -p nabi-providers --test claude_cli_protocol` exit 0
+- first-token P50 / P95 측정 결과 `tests/fixtures/latency-baseline.md` 기록
+
+### Phase 2b
+- `cargo test -p nabi-providers` exit 0
+- 실측: `nabi chat --provider claude_subscription --model sonnet "say 'hi'"` 응답
+- 세션 재개: `nabi chat --sid <SID> --provider ... "continue"` 동작
+- SIGTERM → 5초 내 graceful exit, child orphan 없음
+
+### Phase 2c
+- `nabi-server --mcp-permission-server` stdin/stdout MCP 응답 (initialize / tools/list / tools/call)
+- canary 통과: `claude -p "rm -rf /tmp/canary" --permission-prompt-tool mcp__nabi_auth__approve --mcp-config ...` → 권한 prompt → deny → 실행 안 됨
+- 응답 wrap 형태 (`text` vs 평탄) 결과 문서화 (§ 7.4 canary)
+- timeout 동작 (5분 초과 시 deny 반환)
+
+### Phase 2d
+- 모든 fixture parse 성공
+- unknown 이벤트 → `Unknown { raw }` + raw_events 테이블 행
+- SIGINT → 5초 내 graceful, stream 정리
+
+### Phase 3
+- `nabi-memory` integration test exit 0
+- FTS 검색 결과: nabi-rs vs OpenClaw 동일 (`node ~/clawd/memory-db/search.js "..."`)
+- `~/clawd/memory-db/memory-sync.db` mtime 변동 없음 (read-only 검증)
+- migration: `nabi.db` 새로 생성 시 V0001 적용 + 모든 테이블 존재
+- skill loader: `triggers` 부분 매치 단위 테스트
+
+### Phase 4
+- caveman 활성 시 평균 응답 토큰 / 비활성 시 토큰 비율 < 0.6
+- "자세히 설명해" trigger → caveman OFF 검증
+- Telegram interface → caveman OFF 유지
+- 권한 요청 메시지 → caveman OFF
+- `context_manifests` 테이블에 매 invocation 행 추가
+
+### Phase 5
+- ratatui 키바인딩 6종 (ctrl+c, ctrl+n, ctrl+r, F2, esc, enter) 동작
+- partial token 시각화 (60fps)
+- 세션 picker: `~/.claude/projects/` + `nabi.db` 둘 다 표시, 충돌 시 nabi.db 우선
+- 비용 누계 UI 표시
+- TUI P50 응답 < 2s, P95 < 5s (§ 1.4)
+
+### Phase 6
+- OpenRouter / Ollama 각각 응답 받음 (mock 아닌 실 HTTP)
+- F2로 provider/model 전환 → 즉시 적용
+- Routing rule `<provider>/<model>` 파싱 unit test
+- 라우팅 의도: code_heavy → opus, quick_chat → glm, sensitive → ollama
+
+### Phase 7
+- `pm2 start ecosystem-nabi.config.cjs` → online
+- `kill -TERM` → 5초 내 종료, DB WAL checkpoint 완료
+- `lsof -i :9912` → nabi-server만 listen, 127.0.0.1 bind
+- 외부 머신에서 `<MAC_IP>:9912` 직접 접근 거부
+- 재부팅 후 자동 가동 (수동 검증, `pm2 list` online)
+
+### Phase 8 + 8c
+- CF Access Application 생성 + AUD 캡처
+- 회사 노트북 / iPhone Safari 둘 다 접속 OK (Google OAuth)
+- `cloudflared tunnel ingress validate` exit 0
+- TUI: `nabi-tui auth login` → Keychain `nabi-tui-cf-token` 항목 생성 → WS upgrade 정상
+- Cutover 다운타임 측정 < 10초
+- nabi-new와 nabi 병행 1주 검증 후 cutover (가능 시간 § 10.11 확정 후)
+
+### Phase 9 (PWA)
+- iOS Safari 홈화면 추가 → 오프라인 첫 화면 로드
+- WS 연결 → 메시지 전송 → 응답 → 세션 재개
+- 권한 모달 → allow/deny 동작
+- service worker 캐시 버전업 → 새로고침 토스트
+
+### Phase 10 (Push)
+- VAPID 키 생성 + Keychain 저장
+- push 구독 DB 저장
+- 폰 background 상태에서 push 수신 + 탭 시 PWA 열림
+- 4xx 5회 누적 시 자동 구독 해제
+
+### Phase 11 (Telegram)
+- 봇 토큰 Keychain + chat_id allow list 적용
+- 메시지 → 응답 받기
+- destructive permission default deny (Telegram 경로)
+- inline keyboard allow/deny 동작
+
+### Phase 12 (Failover)
+- Litestream R2 백업 가동 (`/etc/litestream.yml`)
+- 별도 머신에서 백업 복원 → nabi-server 가동 OK
+- `/healthz` 200 + `/metrics` Prometheus format
+- 일일 비용 텔레그램 리포트 자동 전송
+- 디스크 사용량 알림 (`~/.claude/projects/`)
+
+---
+
+## 22. Per-Crate Cargo.toml (v0.3 신규)
+
+각 crate `Cargo.toml`의 `[dependencies]` 핵심 (workspace deps 활용).
+
+### 22.1 nabi-core
+```toml
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+async-stream = { workspace = true }
+```
+
+### 22.2 nabi-providers
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "sync"] }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+```
+
+### 22.3 nabi-memory
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+rusqlite = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+refinery = { version = "0.8", features = ["rusqlite"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+refinery = { version = "0.8", features = ["rusqlite"] }
+```
+
+### 22.4 nabi-skills
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+walkdir = "2"
+regex = "1"
+tracing = { workspace = true }
+```
+
+### 22.5 nabi-context
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+nabi-skills = { path = "../nabi-skills" }
+nabi-memory = { path = "../nabi-memory" }
+tokio = { workspace = true, features = ["fs"] }
+tiktoken-rs = "0.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+```
+
+### 22.6 nabi-server
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+nabi-providers = { path = "../nabi-providers" }
+nabi-memory = { path = "../nabi-memory" }
+nabi-skills = { path = "../nabi-skills" }
+nabi-context = { path = "../nabi-context" }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+keyring = { workspace = true }
+teloxide = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = { workspace = true }
+```
+
+### 22.7 nabi-tui
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.21"
+reqwest = { workspace = true }
+keyring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+```
+
+### 22.8 nabi-web
+```toml
+[dependencies]
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "trace"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+```
+
+### 22.9 nabi-cli
+```toml
+[dependencies]
+nabi-core = { path = "../nabi-core" }
+nabi-providers = { path = "../nabi-providers" }
+nabi-memory = { path = "../nabi-memory" }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+```
+
+### 22.10 workspace deps 추가 필요 항목 (§ 13.2 patch)
+
+```toml
+walkdir = "2"
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tiktoken-rs = "0.6"
+tokio-tungstenite = "0.21"
+eventsource-stream = "0.2"
+refinery = { version = "0.8", features = ["rusqlite"] }
+```
+
+---
+
+## 23. 결정 트리 (v0.3 ultraplan)
+
+각 Phase에서 막힐 때 결정 순서:
+
+### 23.1 Claude CLI 동작이 spec과 다를 때
+1. § 7.3 fixture 갱신 → golden test 추가
+2. § 11.7 unknown event raw 저장으로 살아남기
+3. spec과 안 맞으면 § 4.3 CLI 명령 수정 + version pin
+
+### 23.2 provider 추가 시
+1. § 22 deps 추가
+2. § 7.6 nabi.yaml 신규 entry
+3. Capabilities (§ 7.1) 채움
+4. Phase 6 routing 규칙에 매핑
+
+### 23.3 schema 변경 시
+1. `migrations/V<next>__<desc>.sql` 추가 (forward-only)
+2. 영향받는 crate 컴파일 에러 → 새 컬럼 처리
+3. Phase 12 백업 복원 시나리오 검증
+
+### 23.4 비용 폭주 감지 시
+1. invocation cap (`--max-budget-usd`) 확인
+2. 트랙 B daily cap 도달 → routing이 트랙 A로 fallback
+3. context manifest로 어디서 토큰 쓰는지 추적
+4. 라우팅 규칙으로 잡일 모델 강제
+
+---
+
+## 24. 운영 시 준수할 코딩 규칙 (v0.3)
+
+- async fn은 `&self` 또는 `&mut self`만, `self` consume 지양 (재사용)
+- error는 `?` + `From` 변환. `.unwrap()`은 binary main / test에서만
+- `tokio::spawn`은 명시 join handle 보관. fire-and-forget 금지 (드롭 시 task 취소됨)
+- channel은 `tokio::sync::mpsc` (다대일), `broadcast` (일대다), `oneshot` (응답)
+- subprocess는 항상 `kill_on_drop(true)` + stderr drain task
+- DB writer는 single actor. read는 r2d2 pool
+- JSON 파싱은 `serde_json::Value`로 받은 뒤 도메인 타입으로 변환 (unknown 살아남기)
+- 모든 외부 입력은 boundary에서 검증, 내부는 trust
+- 비밀 (token, api key)은 Keychain → 환경변수 → 파일 순. 평문 로그 금지
+
+---
+
 **문서 끝.**
 
 다음 액션:
-1. Open Decisions § 10.8 (기존 서비스 처리), § 10.10 (자동 로그인), § 10.11 (다운타임 윈도우) 확정
+1. Open Decisions § 10.10 (자동 로그인), § 10.11 (다운타임 윈도우) 확정
 2. Phase -1 시작 (`scripts/phase-minus-1.sh` 실행)
 3. v0.3 후속 점검: pmset 모드 통일 (§ 3.1), MCP 서버명 통일 (§ 3.2), Permission MCP 응답 wrap canary (§ 7.4) — Phase 2a/2c에서 실측 반영
+4. CLI agent에게 위탁 가능 단위: Phase 0 (§ 22 deps + § 20 CI), Phase 1 (§ 16 Error + § 17 ws envelope mock 통합), Phase 2a (§ 21 acceptance 매트릭스 기반)
 3. Phase 0 워크스페이스 셋업
