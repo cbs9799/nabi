@@ -1,7 +1,7 @@
 # 나비-rs 핸드오프 문서
 
-**버전**: 0.3 (Claude CLI 실측 반영 + 비용 트랙 분리 + parser 정합성)
-**이전 버전**: 0.2 (2026-05-15)
+**버전**: 0.3.1 (cross-section 정합성 패치 + TOC)
+**이전 버전**: 0.3 (2026-05-16) → 0.2 (2026-05-15)
 **작성일**: 2026-05-16
 **대상**: 미래의 밤식 + Claude Code CLI (구현 위탁용)
 **상태**: 설계 확정, Phase -1 진입 대기
@@ -14,7 +14,35 @@
 - 결정사항 변경 시 § 표시한 섹션 업데이트, version bump
 - Open Decisions(§ 10) 해소 시 결정 사유 inline 기록
 - 모든 phase는 자체 검증 기준 보유. PR 머지 전 통과 필수
-- **0.1 → 0.2 변경사항은 § 14 변경 이력 참조**
+- **0.1 → 0.2 → 0.3 변경사항은 § 14 변경 이력 참조**
+
+### 0.1 목차 (v0.3.1 — 3700+ 라인 운용성)
+
+- § 1 프로젝트 개요 / § 2 배경 & 제약 / § 3 핵심 결정사항
+- § 4 아키텍처 (4.1 다이어그램 / 4.2 워크스페이스 / 4.3 데이터 흐름 / 4.4 권한 / 4.5 인증 / 4.6 caveman)
+- § 5 기술 스택 / § 6 구현 로드맵 (Phase -1 ~ Phase 12)
+- § 7 코드 스켈레톤 (7.1 Provider / 7.2 Types / 7.3 ClaudeCliProvider / 7.4 Permission MCP / 7.5 claude-settings / 7.6 nabi.yaml / 7.7 Routing 문법)
+- § 8 운영 / § 9 보안 / § 10 Open Decisions
+- § 11 리스크 / § 12 참고자료 / § 13 초기 셋업 / § 14 변경 이력
+- **§ 15 nabi.db 전체 스키마** ← Phase 3 시작 시
+- **§ 16 NabiError 타입** ← Phase 1 시작 시
+- **§ 17 WebSocket 프로토콜** ← Phase 7 시작 시
+- **§ 18 Skill / Wiki / Daily Log 포맷** ← Phase 3 시작 시
+- **§ 19 Migration 시스템** ← Phase 3 시작 시
+- **§ 20 CI Workflow** ← Phase 0 시작 시
+- **§ 21 Phase Acceptance Matrix** ← 매 Phase 머지 직전
+- **§ 22 Per-Crate Cargo.toml** ← Phase 0 시작 시
+- § 23 결정 트리 / § 24 코딩 규칙
+
+#### 위탁 시 cross-ref 가이드
+
+- Phase 0 위탁: § 6 Phase 0 + § 13.2 + § 22 + § 20 + § 21 Phase 0
+- Phase 1 위탁: § 7.1 + § 7.2 + § 16 + § 22.1 + § 21 Phase 1
+- Phase 2a 위탁: § 4.3 + § 7.3 + § 22.2 + § 21 Phase 2a
+- Phase 2c 위탁: § 4.4 + § 7.4 + § 17 + § 21 Phase 2c
+- Phase 3 위탁: § 15 + § 18 + § 19 + § 22.3 + § 21 Phase 3
+- Phase 4 위탁: § 4.6 + § 7.6 prompting + § 22.5 + § 21 Phase 4
+- Phase 7 위탁: § 17 + § 22.6 + § 8.1 + § 21 Phase 7
 
 ---
 
@@ -1838,10 +1866,11 @@ mcp_servers:
     command: "nabi-server"
     args: ["--mcp-permission-server"]
     env: {}
-  nabi_memory:
-    command: "nabi-mcp-memory"
-    args: []
-    env: {}
+  # nabi_memory MCP는 Phase 7+ deferred (v0.3.1).
+  # 별도 crate가 아니라 nabi-server subcommand로 통합 예정:
+  #   command: "nabi-server"
+  #   args: ["--mcp-memory-server"]
+  # 활성화 전까지 Claude는 자체 Read/Grep/Glob으로 ~/clawd/ 접근
 
 # 보안
 security:
@@ -2791,6 +2820,20 @@ cargo watch -x check -x test
 
 ## 14. 변경 이력
 
+### 0.3.1 (2026-05-16) — cross-section 정합성 패치 + 운용성
+
+advisor 세부검토에서 발견한 v0.3 패치들 간 모순 6건 해소:
+
+- § 15.1 `messages.role`: `system` 제거 (§ 7.2 Message enum과 일치). meta prompt는 ChatRequest 별도 필드로
+- § 15.1: `messages.invocation_id` 컬럼 + § 15.2.1 신규 (uuid v4 생성·전파·join 규약)
+- § 15.1: FTS5 UPDATE 트리거 `messages_au` 추가
+- § 7.6: `nabi_memory` MCP 서버 정의 → Phase 7+ deferred (별도 crate 없이 nabi-server subcommand `--mcp-memory-server`로 통합 예정). 활성화 전까지 Claude는 자체 도구로 `~/clawd/` 접근
+- § 17: `chat_with_attachments` 타입 제거. § 17.6 신규 — 멀티모달은 `chat` envelope의 `attachments` 필드로 통일 (Phase 13+ deferred)
+- § 21 Phase 5 acceptance: 60fps frame budget과 § 1.4 응답 latency 척도 분리
+- § 22.10: uuid를 workspace deps에 명시 + 각 crate 참조 규약
+- § 21 Phase 0: `prompting/caveman.md` → `config/prompting/caveman.md` 이동 task 추가 (git mv)
+- § 0.1 신규: TOC + Phase별 cross-ref 가이드
+
 ### 0.3 (2026-05-16) — Claude CLI 2.1.142 실측 반영 + parser 정합성 + 비용 트랙 분리
 
 **검증**: `claude --help` 및 hidden flag probe (`--max-turns`, `--permission-prompt-tool`, `--append-system-prompt-file` 실존 확인). v0.2의 § 4.3 CLI 명령 라인 그대로 유효.
@@ -2918,15 +2961,17 @@ CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
-    role TEXT NOT NULL,                     -- user | assistant | tool | system
+    role TEXT NOT NULL,                     -- user | assistant | tool  (system은 meta prompt, 저장 안 함 — § 7.2 Message enum과 일치)
     content_preview TEXT,                   -- 첫 200자
     tokens_in INTEGER,
     tokens_out INTEGER,
     cost_usd REAL,
+    invocation_id TEXT,                     -- v0.3.1 — Provider::chat() 진입 시 생성한 uuid, cost_ledger / raw_events / context_manifests / audit_log 공통 join key
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(session_id, seq)
 );
 CREATE INDEX idx_messages_session ON messages(session_id, seq);
+CREATE INDEX idx_messages_invocation ON messages(invocation_id);
 
 -- FTS는 content_preview만 인덱싱 (full content는 ~/.claude/projects/ jsonl이 ground truth)
 CREATE VIRTUAL TABLE messages_fts USING fts5(
@@ -2947,6 +2992,14 @@ END;
 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content, seq)
     VALUES('delete', old.id, old.session_id, old.role, old.content_preview, old.seq);
+END;
+
+-- v0.3.1 — content_preview update 시 FTS도 갱신
+CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content, seq)
+    VALUES('delete', old.id, old.session_id, old.role, old.content_preview, old.seq);
+    INSERT INTO messages_fts(rowid, session_id, role, content, seq)
+    VALUES (new.id, new.session_id, new.role, new.content_preview, new.seq);
 END;
 
 CREATE TABLE permission_requests (
@@ -3058,6 +3111,21 @@ CREATE INDEX idx_memev_session ON memory_events(source_session_id);
 - V0003: Phase 10 — push notification 로그 / VAPID 키 회전 기록
 - V0004: Phase 12 — health metrics snapshot 테이블 (선택)
 
+### 15.2.1 invocation_id 규약 (v0.3.1 신규)
+
+- 생성: `Provider::chat()` 진입 시점에 `uuid::Uuid::new_v4()` 1회 생성
+- 형식: 표준 UUID v4 문자열 (`hyphenated`)
+- 전파: nabi-providers → nabi-server (StreamEvent metadata) → DB writer
+- join key 역할:
+  - `messages.invocation_id` — 어시스턴트 응답 메시지가 어느 invocation 산출인지
+  - `cost_ledger.invocation_id` — 비용 ledger 행
+  - `raw_events` — `session_id` + 타임스탬프 범위로 묶지만, 필요 시 invocation_id 컬럼 V0002에서 추가
+  - `context_manifests` — V0002에서 invocation_id 컬럼 추가, 1:1 매핑
+  - `audit_log.details` JSON 내 `invocation_id` 필드
+- 사용 시점: 동일 nabi 세션 내 여러 invocation을 분리 분석 / 비용 추적 / 재현용
+
+V0001은 messages.invocation_id만 포함, raw_events / context_manifests에는 V0002에서 컬럼 추가.
+
 ### 15.3 데이터 보존 정책
 
 - `raw_events`, `audit_log`: 90일 이후 일별 archive (월별 sqlite 파일 분리)
@@ -3157,7 +3225,6 @@ impl From<reqwest::Error> for NabiError {
 
 ```json
 {"v":1,"type":"chat","id":"c-1","sid":"<sid>","content":"안녕"}
-{"v":1,"type":"chat_with_attachments","id":"c-1","sid":"<sid>","content":"...","attachments":[{"kind":"image","data_url":"..."}]}
 {"v":1,"type":"cancel","sid":"<sid>"}
 {"v":1,"type":"permission_response","request_id":"<rid>","allow":true,"updated_input":null}
 {"v":1,"type":"permission_response","request_id":"<rid>","allow":false,"reason":"too dangerous"}
@@ -3202,6 +3269,16 @@ impl From<reqwest::Error> for NabiError {
 `code` 필드 표준 값:
 
 - `budget_exceeded`, `daily_cap_exceeded`, `subprocess_died`, `provider_unavailable`, `auth_failed`, `permission_timeout`, `session_not_found`, `rate_limited`, `internal`
+
+### 17.6 멀티모달 (v0.3.1 — Phase 13+ deferred)
+
+이미지 / 파일 첨부는 현재 out of scope. Phase 13+에서 도입 시 envelope 후보:
+
+```json
+{"v":1,"type":"chat","id":"c-1","sid":"<sid>","content":"...","attachments":[{"kind":"image","data_url":"..."}]}
+```
+
+이전 v0.3 draft에 `chat_with_attachments` 타입이 있었으나, type 분리 대신 `chat` envelope에 `attachments` 필드 옵션 추가하는 방식으로 통일. ChatRequest (§ 7.2)에도 동시 추가 필요. 도입 전까지 모든 attachments 필드 거부.
 
 ---
 
@@ -3404,6 +3481,7 @@ cron schedule (`on: schedule: - cron: "0 18 * * *"` = 한국 시간 03:00) 추�
 - `cargo fmt --all -- --check` exit 0
 - `cargo clippy --all-targets -- -D warnings` exit 0
 - `.github/workflows/ci.yml` last run = success
+- **caveman.md 이동**: `prompting/caveman.md` → `config/prompting/caveman.md` (`git mv`로 이동, history 보존). nabi.yaml `caveman_snippet_path` 경로 일치 검증
 
 ### Phase 1
 - `cargo test -p nabi-core --lib` exit 0
@@ -3449,10 +3527,11 @@ cron schedule (`on: schedule: - cron: "0 18 * * *"` = 한국 시간 03:00) 추�
 
 ### Phase 5
 - ratatui 키바인딩 6종 (ctrl+c, ctrl+n, ctrl+r, F2, esc, enter) 동작
-- partial token 시각화 (60fps)
+- partial token 시각화 (frame budget < 16ms = 60fps render — 별도 척도)
 - 세션 picker: `~/.claude/projects/` + `nabi.db` 둘 다 표시, 충돌 시 nabi.db 우선
 - 비용 누계 UI 표시
-- TUI P50 응답 < 2s, P95 < 5s (§ 1.4)
+- **§ 1.4 응답 latency: first-stream-event P50 < 2s, P95 < 5s** (Claude CLI subscription mode 실측)
+- mock / OpenRouter / Ollama: first-stream-event P50 < 1s
 
 ### Phase 6
 - OpenRouter / Ollama 각각 응답 받음 (mock 아닌 실 HTTP)
@@ -3654,12 +3733,14 @@ serde_json = { workspace = true }
 ```toml
 walkdir = "2"
 regex = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }   # nabi-server, nabi-memory 양쪽 사용
 tiktoken-rs = "0.6"
 tokio-tungstenite = "0.21"
 eventsource-stream = "0.2"
 refinery = { version = "0.8", features = ["rusqlite"] }
 ```
+
+각 crate `Cargo.toml`에서는 `uuid = { workspace = true }` 형태로 참조.
 
 ---
 
