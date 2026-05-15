@@ -374,6 +374,8 @@ nabi-rs/
 │   ├── nabi.yaml                 # 설정 (provider, paths)
 │   ├── AGENTS.md                 # 글로벌 instructions
 │   ├── claude-settings.json      # ★ permissions.deny + sandbox
+│   ├── prompting/
+│   │   └── caveman.md            # ★ 기본 출력 스타일 (§ 4.6, v0.3)
 │   └── skills/
 │       ├── tendril.md
 │       ├── tistory.md
@@ -592,6 +594,48 @@ claude -p "$PROMPT" \
 
 토큰 만료 시 `nabi-tui auth login` 재실행. service token은 healthcheck/CI 전용으로만 사용.
 
+### 4.6 기본 출력 스타일 — caveman mode (v0.3 신규)
+
+**원리**: 출력 토큰만 줄이고 thinking/reasoning은 보존. caveman GitHub 플러그인 방식.
+
+- 관사·필러·헤지·인사·질문 되풀이 제거
+- 짧은 동사·명사 단편 우선
+- 코드 / 경로 / 명령 / 식별자는 verbatim 보존
+- 참고: "Brevity Constraints Reverse Performance Hierarchies" (2026-03) — 간결성 제약이 특정 벤치마크에서 정확도 +26pp
+
+#### 적용 구조
+
+- canonical snippet: `prompting/caveman.md` (Phase 0 후 `config/prompting/caveman.md`)
+- context builder의 **layer 0** (AGENTS.md보다 먼저, 토큰 예산 ~250)
+- 매 invocation `--append-system-prompt-file` 또는 system prompt 첫 블록으로 주입
+
+#### 인터페이스별 정책 (nabi.yaml `prompting:` 블록에서 제어)
+
+- **TUI**: caveman strict (기본)
+- **PWA**: caveman default, UI 토글 제공
+- **Telegram**: relaxed (async + 화면 context 부재로 단편 위험)
+- **permission-prompt-tool 응답 / 에러 / 온보딩**: 항상 relaxed — 명확성 우선
+
+#### 턴 단위 escape hatch
+
+context builder가 사용자 입력에서 다음 trigger 감지 시 그 턴만 caveman 제외:
+
+- `자세히`, `상세히`, `설명해`, `풀어서`
+- `verbose`, `explain`, `walk me through`, `in detail`
+- 명시적 README / post-mortem / design doc 요청
+
+#### 트레이드오프 (v0.3 인지)
+
+- 한국어는 영어보다 토큰 효율 낮음. 단편화가 무례하게 느껴질 수 있음 — 1인 사용 전제로 수용
+- 권한 요청·에러는 절대 caveman 적용 X (사용자가 결정 못 할 수 있음)
+- 첫 1주 운영 후 Telegram 정책 (relaxed → caveman) 재검토
+
+#### Phase 매핑
+
+- Phase 4 Context Builder가 layer 0으로 caveman 주입 구현
+- Phase 5 TUI / Phase 9 PWA / Phase 11 Telegram에서 각 인터페이스 정책 적용
+- Phase 2c permission MCP 응답은 caveman 우회
+
 ---
 
 ## 5. 기술 스택
@@ -787,16 +831,23 @@ claude -p "$PROMPT" \
 - **목적**: 시스템 프롬프트 동적 구성 (토큰 예산 적용)
 - **결과물**:
   - `nabi-context::builder` 완성
-  - 토큰 예산 분배:
+  - 토큰 예산 분배 (v0.3 — caveman 추가):
+    - **caveman.md (layer 0, max 250)** ← § 4.6, 인터페이스 정책 + escape trigger 적용
     - AGENTS.md 글로벌 + 워크스페이스 (max 4K)
     - MEMORY.md hub 요약 (max 2K)
     - 관련 SKILL.md top-2 (max 4K)
     - memory.db FTS top-k (남은 예산)
     - 오늘/어제 daily log (max 2K)
+  - 인터페이스 / escape trigger 평가 로직 (`nabi.yaml prompting:` 블록 기반)
   - 임시 파일 생성 후 `--append-system-prompt-file` 전달
-  - `nabi-context::manifest` (어떤 자료/토큰량 들어갔는지 DB 저장)
+  - `nabi-context::manifest` (어떤 자료/토큰량 들어갔는지 + caveman on/off 기록)
 - **소요**: 3-4일
-- **검증**: 텐드릴 쿼리 → tendril.md 자동 로드. 토큰 한도 준수. manifest DB에 기록 확인
+- **검증**:
+  - 텐드릴 쿼리 → tendril.md 자동 로드. 토큰 한도 준수. manifest DB에 기록
+  - 평범한 쿼리 → caveman 활성, 응답 단편화 확인
+  - "자세히 설명해" trigger → caveman OFF, 평소 prose 응답
+  - Telegram 경로 → caveman OFF 유지
+  - 권한 요청 / 에러 메시지 → caveman OFF 유지
 
 ### Phase 5 — TUI 로컬 모드
 
@@ -1804,11 +1855,33 @@ security:
 # Context Builder 토큰 예산
 context_budget:
   total_max: 30000
+  caveman: 250                         # v0.3 — layer 0, 최우선
   agents_md: 4000
   memory_hub: 2000
   skills_top_k: 4000
   memory_fts: 8000
   daily_log: 2000
+
+# 출력 스타일 (v0.3)
+prompting:
+  default_style: "caveman"             # caveman | relaxed
+  caveman_snippet_path: "config/prompting/caveman.md"
+  per_interface:
+    tui: "caveman"
+    pwa: "caveman"                     # UI에서 토글 가능
+    telegram: "relaxed"                # async / 단편 위험
+    permission_prompt: "relaxed"       # 명확성 우선
+    error: "relaxed"
+    onboarding: "relaxed"
+  escape_triggers:                     # 사용자 입력에 포함되면 그 턴만 caveman 제외
+    - "자세히"
+    - "상세히"
+    - "설명해"
+    - "풀어서"
+    - "verbose"
+    - "explain"
+    - "walk me through"
+    - "in detail"
 
 # Telegram
 telegram:
@@ -2737,6 +2810,10 @@ cargo watch -x check -x test
 - § 2.4: 실측 경로로 정정. `~/nabi/`는 부재, memory db는 `~/clawd/memory-db/memory-sync.db`. claude-telegram-bridge 인벤토리 추가 (port 8787, PM2 4개, Cloudflare Tunnel `bamsigi_tunnel`)
 - § 7.6 nabi.yaml `memory:` 블록 경로 정정
 - § 10.8 결정 완료: 기존 서비스 = `~/Projects/claude-telegram-bridge`, 아카이빙 확정 (사용자 확인)
+- § 4.6 신규: 기본 출력 스타일 = caveman mode (출력 토큰만 단축, thinking 보존). canonical snippet `prompting/caveman.md` 추가
+- § 4.2: workspace layout에 `config/prompting/caveman.md` 추가
+- § 7.6: nabi.yaml `prompting:` 블록 + `context_budget.caveman: 250` 추가
+- § 6 Phase 4: Context Builder layer 0 = caveman, escape trigger 평가, 인터페이스별 정책 검증
 
 **미수정 / 후속**:
 
