@@ -1,7 +1,7 @@
 # 나비-rs 핸드오프 문서
 
-**버전**: 0.3.1 (cross-section 정합성 패치 + TOC)
-**이전 버전**: 0.3 (2026-05-16) → 0.2 (2026-05-15)
+**버전**: 0.3.2 (invocation_id 전파 메커니즘 명시 — advisor 3차 검토)
+**이전 버전**: 0.3.1 → 0.3 (2026-05-16) → 0.2 (2026-05-15)
 **작성일**: 2026-05-16
 **대상**: 미래의 밤식 + Claude Code CLI (구현 위탁용)
 **상태**: 설계 확정, Phase -1 진입 대기
@@ -1071,7 +1071,9 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
-    SessionStarted { id: String, model: String, tools: Vec<String> },
+    // v0.3.1 — invocation_id는 Provider::chat() 진입 시 uuid v4로 생성, SessionStarted에 실어 전파.
+    // 이후 같은 invocation의 모든 후속 이벤트는 downstream에서 invocation_id를 stash하여 태깅.
+    SessionStarted { id: String, invocation_id: String, model: String, tools: Vec<String> },
     TextDelta { content: String },
     ToolUseStart { name: String, id: String },
     ToolUseInput { id: String, partial_json: String },
@@ -1316,7 +1318,9 @@ impl Provider for ClaudeCliProvider {
         // stderr drain task (안 하면 block 가능)
         tokio::spawn(drain_stderr(stderr));
 
-        let stream = parse_ndjson_stream(stdout, child);
+        // v0.3.1 — invocation_id 생성, parser에 전달
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+        let stream = parse_ndjson_stream(stdout, child, invocation_id);
         Ok(Box::pin(stream))
     }
 
@@ -1383,20 +1387,27 @@ async fn drain_stderr(stderr: ChildStderr) {
 // `content_block_start` (type=tool_use) 시점에 `index → id` 매핑을 기록하고
 // `content_block_delta` 시 `event["index"]`로 조회해야 함.
 // content_block_stop에서 매핑 정리.
-#[derive(Default)]
+//
+// v0.3.1 — invocation_id 전파: Provider::chat() 진입 시 생성된 uuid를
+// state에 담아 SessionStarted 이벤트 yield 시 주입.
 struct StreamParserState {
     tool_use_ids: std::collections::HashMap<u64, String>,
+    invocation_id: String,
 }
 
 fn parse_ndjson_stream(
     stdout: ChildStdout,
     mut child: tokio::process::Child,
+    invocation_id: String,
 ) -> impl futures::Stream<Item = Result<StreamEvent, NabiError>> {
     let reader = BufReader::new(stdout);
     let lines = LinesStream::new(reader.lines());
 
     async_stream::stream! {
-        let mut state = StreamParserState::default();
+        let mut state = StreamParserState {
+            tool_use_ids: std::collections::HashMap::new(),
+            invocation_id,
+        };
         let mut lines = Box::pin(lines);
         while let Some(line_result) = lines.next().await {
             match line_result {
@@ -1440,10 +1451,11 @@ fn parse_envelope(
             let subtype = raw["subtype"].as_str().unwrap_or("");
             match subtype {
                 "init" => {
-                    // 새 세션 시작 시 이전 tool_use 매핑 클리어
+                    // 새 invocation 시작 시 이전 tool_use 매핑 클리어
                     state.tool_use_ids.clear();
                     Ok(vec![StreamEvent::SessionStarted {
                         id: raw["session_id"].as_str().unwrap_or("").to_string(),
+                        invocation_id: state.invocation_id.clone(),
                         model: raw["model"].as_str().unwrap_or("").to_string(),
                         tools: raw["tools"].as_array()
                             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -2820,6 +2832,22 @@ cargo watch -x check -x test
 
 ## 14. 변경 이력
 
+### 0.3.2 (2026-05-16) — invocation_id 전파 메커니즘 명시 (advisor 3차)
+
+advisor 3차 검토에서 진짜 결함 1개 발견 — invocation_id가 § 15에 정의되었으나 § 7.2 StreamEvent enum 어디에도 필드 없음 → Phase 2b 구현 시 막힘.
+
+- § 7.2 `SessionStarted` variant에 `invocation_id: String` 필드 추가
+- § 7.3 `StreamParserState`에 `invocation_id` 필드, `parse_ndjson_stream(.., invocation_id)` 시그니처, `Provider::chat()` 진입 시 uuid v4 생성 후 전달
+- § 7.3 `parse_envelope`의 `init` 분기에서 `state.invocation_id.clone()` 으로 SessionStarted 채움
+- § 15.2.1: 전파 메커니즘 = SessionStarted 1회 전송 → downstream stash (envelope 비대화 방지) 명시
+
+**advisor 권고**: 무한 리뷰 모드 진입 신호. 이 패치 후 더 이상 검토 라운드 X, Phase -1 진입.
+
+**Phase 진행 중 자연스럽게 만나면 고칠 항목** (지금 패치 X):
+- § 17 `session_archive` server→client ack 응답 없음
+- § 15 `cost_ledger.track` enum vs § 8.7 명명 불일치 (`subscription`/`api_key` vs `트랙 A`/`트랙 B`)
+- § 22.5 `tiktoken-rs`는 OpenAI BPE — Claude 토큰 카운트는 근사치 한계
+
 ### 0.3.1 (2026-05-16) — cross-section 정합성 패치 + 운용성
 
 advisor 세부검토에서 발견한 v0.3 패치들 간 모순 6건 해소:
@@ -3111,11 +3139,15 @@ CREATE INDEX idx_memev_session ON memory_events(source_session_id);
 - V0003: Phase 10 — push notification 로그 / VAPID 키 회전 기록
 - V0004: Phase 12 — health metrics snapshot 테이블 (선택)
 
-### 15.2.1 invocation_id 규약 (v0.3.1 신규)
+### 15.2.1 invocation_id 규약 (v0.3.1 / 0.3.2 정합화)
 
 - 생성: `Provider::chat()` 진입 시점에 `uuid::Uuid::new_v4()` 1회 생성
-- 형식: 표준 UUID v4 문자열 (`hyphenated`)
-- 전파: nabi-providers → nabi-server (StreamEvent metadata) → DB writer
+- 형식: 표준 UUID v4 문자열 (hyphenated)
+- 전파 메커니즘 (v0.3.2 명시):
+  - Provider가 `StreamParserState.invocation_id`에 stash
+  - 첫 `StreamEvent::SessionStarted { invocation_id, .. }` 이벤트에 실어 yield
+  - downstream consumer (nabi-server)가 SessionStarted에서 invocation_id를 stash → 이후 같은 stream의 모든 이벤트를 그 값으로 태깅
+  - StreamEvent variant 다수에 invocation_id 필드를 추가하지 않음 (envelope 비대화 방지)
 - join key 역할:
   - `messages.invocation_id` — 어시스턴트 응답 메시지가 어느 invocation 산출인지
   - `cost_ledger.invocation_id` — 비용 ledger 행
